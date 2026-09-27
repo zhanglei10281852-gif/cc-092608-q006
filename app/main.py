@@ -10,6 +10,7 @@ from app.core.errors import DomainError
 from app.database import close_connection, get_connection, init_db
 from app.network.router import router as network_router
 from app.network.operations_router import router as operations_router
+from app.network.waitlist_router import router as waitlist_router
 from app.network.schema import ensure_network_schema
 
 
@@ -22,7 +23,7 @@ async def lifespan(app: FastAPI):
     close_connection()
 
 
-app = FastAPI(title="5G-A 场景加速运营服务", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="5G-A 场景加速运营服务", version="2.1.0", lifespan=lifespan)
 
 
 @app.exception_handler(DomainError)
@@ -42,8 +43,9 @@ app.include_router(system.router)
 app.include_router(maintenance.router)
 app.include_router(network_router)
 app.include_router(operations_router)
+app.include_router(waitlist_router)
 
 
 @app.get("/")
 def root() -> dict:
-    return {"service": "5G-A 场景加速运营服务", "version": "2.0.0"}
+    return {"service": "5G-A 场景加速运营服务", "version": "2.1.0"}

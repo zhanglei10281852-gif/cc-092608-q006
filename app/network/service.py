@@ -227,7 +227,9 @@ class NetworkAccelerationService:
             incident_state = "resolved" if result == "completed" else "open"
             connection.execute("UPDATE quality_incidents SET state=?,resolved_at=?,version=version+1 WHERE id=?", (incident_state, now if result == "completed" else None, session["incident_id"]))
             self._event(connection, session_id, result, actor, {"reason": reason}, now)
-            return NetworkRepository(connection).session_detail(session_id)
+            detail = NetworkRepository(connection).session_detail(session_id)
+        self._promote_waitlist(session["scenario_id"], trigger="capacity_released")
+        return detail
 
     def expire_sessions(self, actor: str = "session-reaper") -> dict[str, Any]:
         now = to_storage(self.clock.now())
@@ -243,6 +245,8 @@ class NetworkAccelerationService:
                 connection.execute("UPDATE quality_incidents SET state='open',version=version+1 WHERE id=?", (session["incident_id"],))
                 self._event(connection, row["id"], "expired", actor, {}, now)
                 expired.append(row["id"])
+        if expired:
+            self._promote_waitlist(None, trigger="session_expired")
         return {"expired": expired}
 
     def open_incidents(self, scenario_code: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
@@ -281,6 +285,11 @@ class NetworkAccelerationService:
         if row is None:
             raise NotFoundError("网络场景不存在")
         return row
+
+    def _promote_waitlist(self, scenario_id: int | None, trigger: str) -> None:
+        from app.network.waitlist import WaitlistService
+
+        WaitlistService(self.connection, self.clock).promote_waiting(scenario_id=scenario_id, trigger=trigger)
 
     def _application(self, code: str) -> sqlite3.Row:
         row = self.repository.application_by_code(code)

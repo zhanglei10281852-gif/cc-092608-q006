@@ -171,6 +171,11 @@ class NetworkOperationsService:
                 connection.execute("UPDATE maintenance_windows SET state='completed',updated_at=? WHERE id=?", (now, window["id"]))
                 self._event(connection, "maintenance", window["id"], "completed", actor, {}, now)
                 completed.append(window["id"])
+        if completed:
+            from app.network.waitlist import WaitlistService
+
+            for scenario_id in sorted({int(window["scenario_id"]) for window in ended}):
+                WaitlistService(self.connection, self.clock).promote_waiting(scenario_id=scenario_id, trigger="maintenance_completed")
         return {"activated": activated, "completed": completed}
 
     def blocks_new_session(self, scenario_id: int, segment_id: int | None, now: str) -> dict[str, Any] | None:

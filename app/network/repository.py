@@ -147,6 +147,35 @@ class NetworkRepository:
             (subscriber_hash, scenario_id, now, now),
         ).fetchone()
 
+    def waitlist_entry_by_id(self, entry_id: int) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM waitlist_entries WHERE id=?", (entry_id,)).fetchone()
+
+    def waitlist_entry_by_incident(self, incident_id: int) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM waitlist_entries WHERE incident_id=?", (incident_id,)).fetchone()
+
+    def waiting_entries(self, scenario_id: int | None = None) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM waitlist_entries WHERE state='waiting'"
+        params: list[Any] = []
+        if scenario_id is not None:
+            sql += " AND scenario_id=?"
+            params.append(scenario_id)
+        sql += " ORDER BY id"
+        return self.connection.execute(sql, params).fetchall()
+
+    def active_session_count(self, subscriber_hash: str, scenario_id: int) -> int:
+        return int(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM acceleration_sessions WHERE subscriber_hash=? AND scenario_id=? AND status='active'",
+                (subscriber_hash, scenario_id),
+            ).fetchone()[0]
+        )
+
+    def product_tier_by_code(self, product_code: str) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM product_tiers WHERE product_code=?", (product_code,)).fetchone()
+
+    def list_product_tiers(self) -> list[dict[str, Any]]:
+        return rows_dict(self.connection.execute("SELECT * FROM product_tiers ORDER BY tier DESC,product_code").fetchall())
+
     def session_detail(self, session_id: int) -> dict[str, Any] | None:
         row = self.session_by_id(session_id)
         if row is None:

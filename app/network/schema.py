@@ -199,6 +199,37 @@ CREATE TABLE IF NOT EXISTS operation_events (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_operation_events_resource ON operation_events(resource_type,resource_id,id);
+CREATE TABLE IF NOT EXISTS product_tiers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_code TEXT NOT NULL UNIQUE,
+    tier INTEGER NOT NULL CHECK(tier BETWEEN 0 AND 9),
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS waitlist_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id INTEGER NOT NULL UNIQUE REFERENCES quality_incidents(id),
+    subscriber_hash TEXT NOT NULL,
+    app_id INTEGER NOT NULL REFERENCES application_profiles(id),
+    scenario_id INTEGER NOT NULL REFERENCES network_scenarios(id),
+    segment_id INTEGER REFERENCES network_segments(id),
+    policy_version_id INTEGER NOT NULL REFERENCES policy_versions(id),
+    severity TEXT NOT NULL CHECK(severity IN ('minor','major','critical')),
+    app_priority INTEGER NOT NULL CHECK(app_priority BETWEEN 0 AND 100),
+    entitlement_tier INTEGER NOT NULL CHECK(entitlement_tier BETWEEN 0 AND 9),
+    allocated_downlink_mbps REAL NOT NULL CHECK(allocated_downlink_mbps >= 0),
+    allocated_uplink_mbps REAL NOT NULL CHECK(allocated_uplink_mbps >= 0),
+    priority INTEGER NOT NULL CHECK(priority BETWEEN 0 AND 100),
+    duration_seconds INTEGER NOT NULL CHECK(duration_seconds > 0),
+    state TEXT NOT NULL DEFAULT 'waiting' CHECK(state IN ('waiting','promoted','cancelled','expired')),
+    requested_at TEXT NOT NULL,
+    decided_at TEXT,
+    promoted_session_id INTEGER REFERENCES acceleration_sessions(id),
+    decision_reason TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_waitlist_state ON waitlist_entries(state,scenario_id,segment_id,requested_at);
 '''
 
 
