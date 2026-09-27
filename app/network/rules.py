@@ -23,6 +23,7 @@ DEFAULT_RULES: dict[str, Any] = {
         "duration_seconds": 180,
         "max_downlink_mbps": 200.0,
         "max_uplink_mbps": 50.0,
+        "max_active_per_subscriber": 1,
     },
 }
 
@@ -54,6 +55,9 @@ def validate_rules(rules: dict[str, Any]) -> None:
     duration = allocation.get("duration_seconds")
     if not isinstance(duration, int) or not 30 <= duration <= 3600:
         raise ValidationError("加速时长必须在 30 到 3600 秒之间")
+    max_active = allocation.get("max_active_per_subscriber", 1)
+    if not isinstance(max_active, int) or isinstance(max_active, bool) or not 1 <= max_active <= 8:
+        raise ValidationError("每用户并发加速上限必须是 1 到 8 的整数")
 
 
 def judge_quality(sample: dict[str, Any], profile: dict[str, Any], rules: dict[str, Any]) -> QualityDecision:

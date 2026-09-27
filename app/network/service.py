@@ -12,6 +12,7 @@ from app.database import get_connection, transaction
 from app.network.repository import NetworkRepository
 from app.network.rules import DEFAULT_RULES, allocation_for, canonical_rules, judge_quality
 from app.network.schema import ensure_network_schema
+from app.network.waitlist import DEFAULT_MAX_ACTIVE_PER_SUBSCRIBER, WaitlistService
 
 
 class NetworkAccelerationService:
@@ -20,6 +21,7 @@ class NetworkAccelerationService:
         ensure_network_schema(self.connection)
         self.clock = clock or SystemClock()
         self.repository = NetworkRepository(self.connection)
+        self.waitlist = WaitlistService(self.connection, self.clock)
 
     def create_scenario(self, payload: dict[str, Any]) -> dict[str, Any]:
         now = to_storage(self.clock.now())
@@ -117,8 +119,8 @@ class NetworkAccelerationService:
             if existing is not None:
                 return dict(existing)
             cursor = connection.execute(
-                "INSERT INTO subscriber_entitlements(subscriber_hash,scenario_id,product_code,valid_from,valid_until,source_order_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                (payload["subscriber_hash"], scenario["id"], payload["product_code"], start, end, payload["source_order_id"], now, now),
+                "INSERT INTO subscriber_entitlements(subscriber_hash,scenario_id,product_code,tier_level,valid_from,valid_until,source_order_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (payload["subscriber_hash"], scenario["id"], payload["product_code"], int(payload.get("tier_level", 50)), start, end, payload["source_order_id"], now, now),
             )
             return dict(connection.execute("SELECT * FROM subscriber_entitlements WHERE id=?", (cursor.lastrowid,)).fetchone())
 
@@ -170,9 +172,14 @@ class NetworkAccelerationService:
             raise NotFoundError("质差事件不存在")
         existing = self.repository.session_by_incident(incident_id)
         if existing is not None:
-            return self.repository.session_detail(existing["id"])
+            result = self.repository.session_detail(existing["id"])
+            result["queued"] = False
+            return result
         if incident["state"] != "open":
             raise ConflictError("只有待处理事件可以启动加速")
+        waiting = self.repository.waiting_entry_for_incident(incident_id)
+        if waiting is not None:
+            return {"queued": True, "duplicate": True, "reason": waiting["queue_reason"], "entry": self.waitlist.detail(waiting["id"])}
         sample = self.repository.sample_by_id(incident["sample_id"])
         app = self.repository.application_by_id(incident["app_id"])
         now_value = self.clock.now()
@@ -187,16 +194,43 @@ class NetworkAccelerationService:
         allocation = allocation_for(dict(app), incident["severity"], rules)
         scenario = self.repository.scenario_by_id(incident["scenario_id"])
         segment = self.repository.segment_by_id(incident["segment_id"]) if incident["segment_id"] else None
-        from app.network.operations import NetworkOperationsService
-        maintenance = NetworkOperationsService(self.connection, self.clock).blocks_new_session(incident["scenario_id"], incident["segment_id"], now)
-        if maintenance is not None:
-            raise ConflictError("当前场景处于维护窗口，不能启动新的加速会话", context={"maintenance_code": maintenance["code"]})
+        maintenance = self.repository.blocking_maintenance(incident["scenario_id"], incident["segment_id"], now)
+        max_active = int(rules["allocation"].get("max_active_per_subscriber", DEFAULT_MAX_ACTIVE_PER_SUBSCRIBER))
         limit = int(segment["capacity_mbps"] if segment else scenario["capacity_mbps"])
         used = self.repository.active_capacity(incident["scenario_id"], incident["segment_id"])
-        if used["sessions"] >= int(scenario["max_concurrent_sessions"]):
-            raise ConflictError("场景并发加速会话已达到上限")
-        if used["downlink_mbps"] + allocation.downlink_mbps > limit:
-            raise ConflictError("区段下行加速容量不足")
+        active_for_subscriber = self.repository.subscriber_active_sessions(sample["subscriber_hash"], incident["scenario_id"])
+        reason = None
+        if maintenance is not None:
+            reason = "maintenance_window"
+        elif active_for_subscriber >= max_active:
+            reason = "subscriber_concurrency"
+        elif used["sessions"] >= int(scenario["max_concurrent_sessions"]):
+            reason = "scenario_concurrency"
+        elif used["downlink_mbps"] + allocation.downlink_mbps > limit:
+            reason = "capacity"
+        if reason is not None:
+            entry = {
+                "incident_id": incident_id,
+                "subscriber_hash": sample["subscriber_hash"],
+                "app_id": incident["app_id"],
+                "scenario_id": incident["scenario_id"],
+                "segment_id": incident["segment_id"],
+                "policy_version_id": policy["id"],
+                "severity": incident["severity"],
+                "app_priority": int(app["default_priority"]),
+                "tier_level": int(entitlement["tier_level"]),
+                "session_priority": allocation.priority,
+                "allocated_downlink_mbps": allocation.downlink_mbps,
+                "allocated_uplink_mbps": allocation.uplink_mbps,
+                "duration_seconds": allocation.duration_seconds,
+                "max_active_per_subscriber": max_active,
+                "queue_reason": reason,
+            }
+            event_detail = {"maintenance_code": maintenance["code"]} if maintenance is not None else None
+            with transaction(immediate=True) as connection:
+                entry_id, duplicate = self.waitlist.enqueue(connection, entry, actor, now_value, event_detail)
+                result = self.waitlist.detail(entry_id, connection)
+            return {"queued": True, "duplicate": duplicate, "reason": reason, "entry": result}
         expires = to_storage(now_value + timedelta(seconds=allocation.duration_seconds))
         with transaction(immediate=True) as connection:
             cursor = connection.execute(
@@ -209,7 +243,9 @@ class NetworkAccelerationService:
             )
             connection.execute("UPDATE quality_incidents SET state='accelerating',version=version+1 WHERE id=?", (incident_id,))
             self._event(connection, cursor.lastrowid, "started", actor, {"policy_version": policy["version_no"]}, now)
-            return NetworkRepository(connection).session_detail(cursor.lastrowid)
+            result = NetworkRepository(connection).session_detail(cursor.lastrowid)
+            result["queued"] = False
+            return result
 
     def finish_session(self, session_id: int, actor: str, reason: str, result: str) -> dict[str, Any]:
         session = self.repository.session_by_id(session_id)
@@ -217,7 +253,8 @@ class NetworkAccelerationService:
             raise NotFoundError("加速会话不存在")
         if session["status"] != "active":
             return self.repository.session_detail(session_id)
-        now = to_storage(self.clock.now())
+        now_value = self.clock.now()
+        now = to_storage(now_value)
         with transaction(immediate=True) as connection:
             connection.execute(
                 "UPDATE acceleration_sessions SET status=?,ended_at=?,end_reason=?,version=version+1 WHERE id=? AND status='active'",
@@ -227,12 +264,18 @@ class NetworkAccelerationService:
             incident_state = "resolved" if result == "completed" else "open"
             connection.execute("UPDATE quality_incidents SET state=?,resolved_at=?,version=version+1 WHERE id=?", (incident_state, now if result == "completed" else None, session["incident_id"]))
             self._event(connection, session_id, result, actor, {"reason": reason}, now)
-            return NetworkRepository(connection).session_detail(session_id)
+            promoted = self.waitlist.promote_scope(connection, session["scenario_id"], session["segment_id"], actor, now_value)
+            detail = NetworkRepository(connection).session_detail(session_id)
+        if promoted:
+            detail["promoted_waitlist_entries"] = promoted
+        return detail
 
     def expire_sessions(self, actor: str = "session-reaper") -> dict[str, Any]:
-        now = to_storage(self.clock.now())
+        now_value = self.clock.now()
+        now = to_storage(now_value)
         rows = self.connection.execute("SELECT id FROM acceleration_sessions WHERE status='active' AND expires_at<=? ORDER BY id", (now,)).fetchall()
         expired = []
+        promoted: list[int] = []
         for row in rows:
             with transaction(immediate=True) as connection:
                 session = NetworkRepository(connection).session_by_id(row["id"])
@@ -242,8 +285,9 @@ class NetworkAccelerationService:
                 connection.execute("UPDATE capacity_reservations SET state='released',released_at=? WHERE session_id=? AND state='held'", (now, row["id"]))
                 connection.execute("UPDATE quality_incidents SET state='open',version=version+1 WHERE id=?", (session["incident_id"],))
                 self._event(connection, row["id"], "expired", actor, {}, now)
+                promoted.extend(self.waitlist.promote_scope(connection, session["scenario_id"], session["segment_id"], actor, now_value))
                 expired.append(row["id"])
-        return {"expired": expired}
+        return {"expired": expired, "promoted": promoted}
 
     def open_incidents(self, scenario_code: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         scenario_id = self._scenario(scenario_code)["id"] if scenario_code else None
@@ -254,6 +298,13 @@ class NetworkAccelerationService:
         if result is None:
             raise NotFoundError("加速会话不存在")
         return result
+
+    def waitlist_entries(self, scenario_code: str | None = None, state: str = "waiting", limit: int = 100) -> list[dict[str, Any]]:
+        scenario_id = self._scenario(scenario_code)["id"] if scenario_code else None
+        return self.waitlist.list_entries(scenario_id=scenario_id, state=state, limit=limit)
+
+    def waitlist_entry(self, entry_id: int) -> dict[str, Any]:
+        return self.waitlist.detail(entry_id)
 
     def summary(self) -> dict[str, Any]:
         return self.repository.summary()

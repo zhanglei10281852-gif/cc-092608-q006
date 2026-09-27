@@ -102,7 +102,7 @@ def test_maintenance_blocks_acceleration(client):
     policy = prepare(client)
     client.post(
         "/api/network/entitlements",
-        json={"subscriber_hash": "subscriber-maintenance-01", "scenario_code": "venue-01", "product_code": "venue-boost", "valid_from": "2026-09-26T00:00:00Z", "valid_until": "2026-09-27T00:00:00Z", "source_order_id": "maintenance-order"},
+        json={"subscriber_hash": "subscriber-maintenance-01", "scenario_code": "venue-01", "product_code": "venue-boost", "valid_from": "2026-09-26T00:00:00Z", "valid_until": "2030-01-01T00:00:00Z", "source_order_id": "maintenance-order"},
     )
     sample = client.post(
         "/api/network/samples",
@@ -113,6 +113,10 @@ def test_maintenance_blocks_acceleration(client):
         json={"scenario_code": "venue-01", "segment_code": "east", "code": "active-maintenance", "reason": "射频调整", "starts_at": "2020-01-01T00:00:00Z", "ends_at": "2030-01-01T00:00:00Z", "drain_mode": "block_new", "actor": "operator"},
     )
     assert created.status_code == 201
-    denied = client.post(f"/api/network/incidents/{sample['incident_id']}/accelerate", json={"actor": "operator"})
-    assert denied.status_code == 409
-    assert denied.json()["error"]["context"]["maintenance_code"] == "active-maintenance"
+    queued = client.post(f"/api/network/incidents/{sample['incident_id']}/accelerate", json={"actor": "operator"})
+    assert queued.status_code == 200
+    assert queued.json()["queued"] is True
+    assert queued.json()["reason"] == "maintenance_window"
+    entry = queued.json()["entry"]
+    assert entry["queue_reason"] == "maintenance_window"
+    assert entry["events"][0]["detail"]["maintenance_code"] == "active-maintenance"

@@ -9,6 +9,7 @@ from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.database import get_connection, transaction
 from app.network.repository import NetworkRepository
 from app.network.schema import ensure_network_schema
+from app.network.waitlist import WaitlistService
 
 
 class NetworkOperationsService:
@@ -17,6 +18,7 @@ class NetworkOperationsService:
         ensure_network_schema(self.connection)
         self.clock = clock or SystemClock()
         self.repository = NetworkRepository(self.connection)
+        self.waitlist = WaitlistService(self.connection, self.clock)
 
     def create_campaign(self, payload: dict[str, Any]) -> dict[str, Any]:
         scenario = self._scenario(payload["scenario_code"])
@@ -157,9 +159,11 @@ class NetworkOperationsService:
         return result
 
     def activate_due_maintenance(self, actor: str = "maintenance-scheduler") -> dict[str, Any]:
-        now = to_storage(self.clock.now())
+        now_value = self.clock.now()
+        now = to_storage(now_value)
         activated: list[int] = []
         completed: list[int] = []
+        promoted: list[int] = []
         with transaction(immediate=True) as connection:
             due = connection.execute("SELECT * FROM maintenance_windows WHERE state='scheduled' AND starts_at<=? ORDER BY id", (now,)).fetchall()
             for window in due:
@@ -171,13 +175,16 @@ class NetworkOperationsService:
                 connection.execute("UPDATE maintenance_windows SET state='completed',updated_at=? WHERE id=?", (now, window["id"]))
                 self._event(connection, "maintenance", window["id"], "completed", actor, {}, now)
                 completed.append(window["id"])
-        return {"activated": activated, "completed": completed}
+                if window["segment_id"] is None:
+                    promoted.extend(self.waitlist.promote_scope(connection, window["scenario_id"], None, actor, now_value))
+                    for segment in NetworkRepository(connection).segments(window["scenario_id"]):
+                        promoted.extend(self.waitlist.promote_scope(connection, window["scenario_id"], segment["id"], actor, now_value))
+                else:
+                    promoted.extend(self.waitlist.promote_scope(connection, window["scenario_id"], window["segment_id"], actor, now_value))
+        return {"activated": activated, "completed": completed, "promoted": promoted}
 
     def blocks_new_session(self, scenario_id: int, segment_id: int | None, now: str) -> dict[str, Any] | None:
-        row = self.connection.execute(
-            "SELECT * FROM maintenance_windows WHERE scenario_id=? AND (segment_id IS NULL OR segment_id IS ?) AND state IN ('scheduled','active') AND starts_at<=? AND ends_at>? ORDER BY segment_id DESC,id LIMIT 1",
-            (scenario_id, segment_id, now, now),
-        ).fetchone()
+        row = self.repository.blocking_maintenance(scenario_id, segment_id, now)
         if row is None:
             return None
         return dict(row)

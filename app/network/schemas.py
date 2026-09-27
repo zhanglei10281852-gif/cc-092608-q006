@@ -47,6 +47,7 @@ class EntitlementCreate(BaseModel):
     subscriber_hash: str = Field(min_length=16, max_length=128)
     scenario_code: str = Field(min_length=2, max_length=64)
     product_code: str = Field(min_length=2, max_length=80)
+    tier_level: int = Field(default=50, ge=0, le=100)
     valid_from: str
     valid_until: str
     source_order_id: str = Field(min_length=4, max_length=160)

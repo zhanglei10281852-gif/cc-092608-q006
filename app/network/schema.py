@@ -138,6 +138,7 @@ CREATE TABLE IF NOT EXISTS subscriber_entitlements (
     subscriber_hash TEXT NOT NULL,
     scenario_id INTEGER NOT NULL REFERENCES network_scenarios(id),
     product_code TEXT NOT NULL,
+    tier_level INTEGER NOT NULL DEFAULT 50 CHECK(tier_level BETWEEN 0 AND 100),
     valid_from TEXT NOT NULL,
     valid_until TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','suspended','expired','cancelled')),
@@ -146,6 +147,41 @@ CREATE TABLE IF NOT EXISTS subscriber_entitlements (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_entitlements_lookup ON subscriber_entitlements(subscriber_hash,scenario_id,state,valid_from,valid_until);
+CREATE TABLE IF NOT EXISTS acceleration_waitlist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id INTEGER NOT NULL REFERENCES quality_incidents(id) ON DELETE CASCADE,
+    subscriber_hash TEXT NOT NULL,
+    app_id INTEGER NOT NULL REFERENCES application_profiles(id),
+    scenario_id INTEGER NOT NULL REFERENCES network_scenarios(id),
+    segment_id INTEGER REFERENCES network_segments(id),
+    policy_version_id INTEGER NOT NULL REFERENCES policy_versions(id),
+    severity TEXT NOT NULL CHECK(severity IN ('minor','major','critical')),
+    app_priority INTEGER NOT NULL CHECK(app_priority BETWEEN 0 AND 100),
+    tier_level INTEGER NOT NULL DEFAULT 50 CHECK(tier_level BETWEEN 0 AND 100),
+    session_priority INTEGER NOT NULL CHECK(session_priority BETWEEN 0 AND 100),
+    allocated_downlink_mbps REAL NOT NULL CHECK(allocated_downlink_mbps >= 0),
+    allocated_uplink_mbps REAL NOT NULL CHECK(allocated_uplink_mbps >= 0),
+    duration_seconds INTEGER NOT NULL CHECK(duration_seconds > 0),
+    max_active_per_subscriber INTEGER NOT NULL DEFAULT 1 CHECK(max_active_per_subscriber BETWEEN 1 AND 8),
+    queue_reason TEXT NOT NULL CHECK(queue_reason IN ('capacity','scenario_concurrency','subscriber_concurrency','maintenance_window')),
+    state TEXT NOT NULL DEFAULT 'waiting' CHECK(state IN ('waiting','promoted','cancelled')),
+    requested_at TEXT NOT NULL,
+    decided_at TEXT,
+    session_id INTEGER REFERENCES acceleration_sessions(id),
+    cancel_reason TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 1
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_waitlist_waiting_incident ON acceleration_waitlist(incident_id) WHERE state='waiting';
+CREATE INDEX IF NOT EXISTS idx_waitlist_scope ON acceleration_waitlist(scenario_id,segment_id,state,requested_at,id);
+CREATE TABLE IF NOT EXISTS waitlist_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id INTEGER NOT NULL REFERENCES acceleration_waitlist(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_waitlist_events ON waitlist_events(entry_id,id);
 CREATE TABLE IF NOT EXISTS rollout_campaigns (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     scenario_id INTEGER NOT NULL REFERENCES network_scenarios(id),
@@ -204,3 +240,8 @@ CREATE INDEX IF NOT EXISTS idx_operation_events_resource ON operation_events(res
 
 def ensure_network_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(NETWORK_SCHEMA)
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(subscriber_entitlements)")}
+    if "tier_level" not in columns:
+        connection.execute(
+            "ALTER TABLE subscriber_entitlements ADD COLUMN tier_level INTEGER NOT NULL DEFAULT 50 CHECK(tier_level BETWEEN 0 AND 100)"
+        )

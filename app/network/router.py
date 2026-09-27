@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from fastapi import APIRouter, Query
 
 from app.database import get_connection
@@ -87,6 +89,20 @@ def finish_session(session_id: int, payload: SessionFinish):
 @router.post("/sessions/expire")
 def expire_sessions(actor: str = Query(default="session-reaper", min_length=1)):
     return service().expire_sessions(actor)
+
+
+@router.get("/waitlist")
+def list_waitlist(
+    scenario_code: str | None = None,
+    state: Literal["waiting", "promoted", "cancelled"] = "waiting",
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    return {"items": service().waitlist_entries(scenario_code, state, limit)}
+
+
+@router.get("/waitlist/{entry_id}")
+def waitlist_entry(entry_id: int):
+    return service().waitlist_entry(entry_id)
 
 
 @router.get("/summary")

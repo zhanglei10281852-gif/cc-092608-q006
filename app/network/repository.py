@@ -147,6 +147,72 @@ class NetworkRepository:
             (subscriber_hash, scenario_id, now, now),
         ).fetchone()
 
+    def subscriber_active_sessions(self, subscriber_hash: str, scenario_id: int) -> int:
+        return int(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM acceleration_sessions WHERE subscriber_hash=? AND scenario_id=? AND status='active'",
+                (subscriber_hash, scenario_id),
+            ).fetchone()[0]
+        )
+
+    def blocking_maintenance(self, scenario_id: int, segment_id: int | None, now: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM maintenance_windows WHERE scenario_id=? AND (segment_id IS NULL OR segment_id IS ?) "
+            "AND state IN ('scheduled','active') AND starts_at<=? AND ends_at>? ORDER BY segment_id DESC,id LIMIT 1",
+            (scenario_id, segment_id, now, now),
+        ).fetchone()
+
+    def waiting_entry_for_incident(self, incident_id: int) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM acceleration_waitlist WHERE incident_id=? AND state='waiting'",
+            (incident_id,),
+        ).fetchone()
+
+    def waitlist_entry(self, entry_id: int) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT w.*,n.code AS scenario_code,g.code AS segment_code,a.app_code "
+            "FROM acceleration_waitlist w JOIN network_scenarios n ON n.id=w.scenario_id "
+            "LEFT JOIN network_segments g ON g.id=w.segment_id "
+            "JOIN application_profiles a ON a.id=w.app_id WHERE w.id=?",
+            (entry_id,),
+        ).fetchone()
+
+    def waiting_entries_for_scope(self, scenario_id: int, segment_id: int | None) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT * FROM acceleration_waitlist WHERE scenario_id=? AND segment_id IS ? AND state='waiting'",
+            (scenario_id, segment_id),
+        ).fetchall()
+
+    def waitlist_entries(self, *, scenario_id: int | None = None, state: str | None = None, limit: int = 500) -> list[sqlite3.Row]:
+        sql = (
+            "SELECT w.*,n.code AS scenario_code,g.code AS segment_code,a.app_code "
+            "FROM acceleration_waitlist w JOIN network_scenarios n ON n.id=w.scenario_id "
+            "LEFT JOIN network_segments g ON g.id=w.segment_id "
+            "JOIN application_profiles a ON a.id=w.app_id"
+        )
+        clauses: list[str] = []
+        params: list[Any] = []
+        if scenario_id is not None:
+            clauses.append("w.scenario_id=?")
+            params.append(scenario_id)
+        if state is not None:
+            clauses.append("w.state=?")
+            params.append(state)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY w.scenario_id,w.segment_id,w.requested_at,w.id LIMIT ?"
+        params.append(limit)
+        return self.connection.execute(sql, params).fetchall()
+
+    def waitlist_events(self, entry_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute("SELECT * FROM waitlist_events WHERE entry_id=? ORDER BY id", (entry_id,)).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["detail"] = json.loads(item.pop("detail_json"))
+            result.append(item)
+        return result
+
     def session_detail(self, session_id: int) -> dict[str, Any] | None:
         row = self.session_by_id(session_id)
         if row is None:
@@ -164,11 +230,13 @@ class NetworkRepository:
         scenarios = self.connection.execute("SELECT status,COUNT(*) FROM network_scenarios GROUP BY status").fetchall()
         incidents = self.connection.execute("SELECT state,COUNT(*) FROM quality_incidents GROUP BY state").fetchall()
         sessions = self.connection.execute("SELECT status,COUNT(*) FROM acceleration_sessions GROUP BY status").fetchall()
+        waitlist = self.connection.execute("SELECT state,COUNT(*) FROM acceleration_waitlist GROUP BY state").fetchall()
         samples = int(self.connection.execute("SELECT COUNT(*) FROM experience_samples").fetchone()[0])
         return {
             "scenarios": {row[0]: row[1] for row in scenarios},
             "incidents": {row[0]: row[1] for row in incidents},
             "sessions": {row[0]: row[1] for row in sessions},
+            "waitlist": {row[0]: row[1] for row in waitlist},
             "samples": samples,
         }
 

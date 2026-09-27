@@ -112,7 +112,7 @@ def test_acceleration_requires_entitlement_and_releases_capacity(client):
             "scenario_code": "gdh-rail",
             "product_code": "rail-boost-day",
             "valid_from": "2026-09-26T00:00:00Z",
-            "valid_until": "2026-09-27T00:00:00Z",
+            "valid_until": "2030-01-01T00:00:00Z",
             "source_order_id": "order-000001",
         },
     )
@@ -141,7 +141,7 @@ def test_expired_session_reopens_incident_with_fixed_clock(client):
             "scenario_code": "gdh-rail",
             "product_code": "rail-boost-day",
             "valid_from": "2026-09-26T00:00:00Z",
-            "valid_until": "2026-09-27T00:00:00Z",
+            "valid_until": "2030-01-01T00:00:00Z",
             "source_order_id": "order-000002",
         },
     )
@@ -159,10 +159,11 @@ def test_expired_session_reopens_incident_with_fixed_clock(client):
     assert incident["state"] == "open"
 
 
-def test_capacity_limit_rejects_second_session(client):
+def test_capacity_limit_queues_second_session(client):
     prepare(client)
     connection = get_connection()
     connection.execute("UPDATE network_segments SET capacity_mbps=20 WHERE code='gz-sz-01'")
+    responses = []
     for index in (1, 2):
         subscriber = f"subscriber-{index:018d}"
         client.post(
@@ -172,16 +173,32 @@ def test_capacity_limit_rejects_second_session(client):
                 "scenario_code": "gdh-rail",
                 "product_code": "rail-boost-day",
                 "valid_from": "2026-09-26T00:00:00Z",
-                "valid_until": "2026-09-27T00:00:00Z",
+                "valid_until": "2030-01-01T00:00:00Z",
                 "source_order_id": f"order-capacity-{index:03d}",
             },
         )
         sample = client.post("/api/network/samples", json=sample_payload(sample_key=f"sample-capacity-{index:03d}", subscriber_hash=subscriber)).json()
-        response = client.post(f"/api/network/incidents/{sample['incident_id']}/accelerate", json={"actor": "tests"})
-        if index == 1:
-            assert response.status_code == 200
-        else:
-            assert response.status_code == 409
+        responses.append((sample, client.post(f"/api/network/incidents/{sample['incident_id']}/accelerate", json={"actor": "tests"})))
+    first_sample, first = responses[0]
+    second_sample, second = responses[1]
+    assert first.status_code == 200
+    assert first.json()["queued"] is False
+    assert second.status_code == 200
+    assert second.json()["queued"] is True
+    assert second.json()["reason"] == "capacity"
+    entry = second.json()["entry"]
+    assert entry["rank"] == 1
+    finished = client.post(
+        f"/api/network/sessions/{first.json()['id']}/finish",
+        json={"actor": "tests", "reason": "体验恢复", "result": "completed"},
+    )
+    assert finished.status_code == 200
+    promoted = client.get(f"/api/network/waitlist/{entry['id']}")
+    assert promoted.status_code == 200
+    assert promoted.json()["state"] == "promoted"
+    assert promoted.json()["session_id"] is not None
+    incident = connection.execute("SELECT state FROM quality_incidents WHERE id=?", (second_sample["incident_id"],)).fetchone()
+    assert incident["state"] == "accelerating"
 
 
 def test_policy_versions_replace_previous_publication(client):
